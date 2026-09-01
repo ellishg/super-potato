@@ -24,39 +24,6 @@ GPATH
 # cache dir
 .cache/
 
-# Doc build artifacts
-docs/_build/
-docs/doxygen_sqlite3.db
-
-# Downloaded font files
-docs/_static/DejaVuSans.ttf
-docs/_static/NotoSansSC-Regular.otf
-
-# Components Unit Test Apps files
-components/**/build/
-components/**/build_*_*/
-components/**/sdkconfig
-components/**/sdkconfig.old
-components/**/test_apps/wifi_nvs_config/nvs_data_suffix.csv
-
-# Example project files
-examples/**/build/
-examples/**/build_*_*/
-examples/**/sdkconfig
-examples/**/sdkconfig.old
-
-# Unit test app files
-tools/unit-test-app/build
-tools/unit-test-app/build_*_*/
-tools/unit-test-app/sdkconfig
-tools/unit-test-app/sdkconfig.old
-
-# test application build files
-tools/test_apps/**/build/
-tools/test_apps/**/build_*_*/
-tools/test_apps/**/sdkconfig
-tools/test_apps/**/sdkconfig.old
-
 TEST_LOGS/
 build_summary_*.xml
 

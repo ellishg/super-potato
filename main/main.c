@@ -1,54 +1,54 @@
-/*
- * SPDX-FileCopyrightText: 2010-2026 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
-#include <stdio.h>
-#include <inttypes.h>
-#include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "esp_check.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_system.h"
+#include <stdio.h>
 
-void app_main(void)
-{
-    printf("Hello world!\n");
+#define BYTES_TO_KB(bytes) ((uint32_t)((bytes) / 1024))
+#define BYTES_TO_MB(bytes) ((uint32_t)((bytes) / (1024 * 1024)))
 
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    uint32_t flash_size;
-    esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU core(s), %s%s%s%s%s%s, ",
-           CONFIG_IDF_TARGET,
-           chip_info.cores,
-           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi" : "",
-           ((chip_info.features & CHIP_FEATURE_WIFI_BGN) && (chip_info.features & (CHIP_FEATURE_BT | CHIP_FEATURE_BLE))) ? "/" : "",
-           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-           ((chip_info.features & CHIP_FEATURE_BT) && (chip_info.features & CHIP_FEATURE_BLE)) ? "/" : "",
-           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+static const char *TAG = "super-potato";
 
-    unsigned major_rev = chip_info.revision / 100;
-    unsigned minor_rev = chip_info.revision % 100;
-    printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-    if(esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-        printf("Get flash size failed");
-        return;
-    }
+esp_err_t run(void) {
+  esp_chip_info_t chip_info;
+  esp_chip_info(&chip_info);
 
-    printf("%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-           (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
+  uint32_t flash_size;
+  ESP_RETURN_ON_ERROR(esp_flash_get_size(NULL, &flash_size), TAG,
+                      "Get flash size failed");
 
-    printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
+  ESP_LOGI(TAG, "%" PRIu32 "MB %s flash", BYTES_TO_MB(flash_size),
+           (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded"
+                                                         : "external");
+  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB\n",
+           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
 
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
+  const esp_partition_t *partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+  ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG, "Partition not found");
+
+  esp_partition_mmap_handle_t map_handle;
+  const char *model_data;
+  ESP_RETURN_ON_ERROR(
+      esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA,
+                         (const void **)&model_data, &map_handle),
+      TAG, "Failed to mmap model");
+  ESP_LOGI(TAG, "model mmaped at %p with size %" PRIu32 " MB", model_data,
+           BYTES_TO_MB(partition->size));
+
+  for (size_t i = 0; i < 100; i++) {
+    printf("%c", model_data[i]);
+  }
+  return ESP_OK;
+}
+
+void app_main(void) {
+  esp_err_t err = run();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Error running application: %s", esp_err_to_name(err));
+  }
+  fflush(stdout);
+  ESP_LOGI(TAG, "Application finished");
 }
