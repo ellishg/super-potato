@@ -1,5 +1,7 @@
 # super-potato
 
+This is an attempt to run an LLM on an esp32p4. The implementation was copied from https://github.com/karpathy/llama2.c.
+
 # Dependencies
 Install and activate eim
 https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html
