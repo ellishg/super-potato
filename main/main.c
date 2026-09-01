@@ -11,6 +11,12 @@
 
 static const char *TAG = "super-potato";
 
+void run_with_model(const char *model_data, size_t model_size) {
+  for (size_t i = 0; i < 100; i++)
+    printf("%c", model_data[i]);
+  printf("\n");
+}
+
 esp_err_t run(void) {
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
@@ -22,7 +28,7 @@ esp_err_t run(void) {
   ESP_LOGI(TAG, "%" PRIu32 "MB %s flash", BYTES_TO_MB(flash_size),
            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded"
                                                          : "external");
-  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB\n",
+  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
            BYTES_TO_KB(esp_get_minimum_free_heap_size()));
 
   const esp_partition_t *partition = esp_partition_find_first(
@@ -38,17 +44,13 @@ esp_err_t run(void) {
   ESP_LOGI(TAG, "model mmaped at %p with size %" PRIu32 " MB", model_data,
            BYTES_TO_MB(partition->size));
 
-  for (size_t i = 0; i < 100; i++) {
-    printf("%c", model_data[i]);
-  }
+  run_with_model(model_data, partition->size);
   return ESP_OK;
 }
 
 void app_main(void) {
   esp_err_t err = run();
-  if (err != ESP_OK) {
+  if (err != ESP_OK)
     ESP_LOGE(TAG, "Error running application: %s", esp_err_to_name(err));
-  }
-  fflush(stdout);
   ESP_LOGI(TAG, "Application finished");
 }
