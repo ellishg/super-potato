@@ -1,19 +1,27 @@
 #include "esp_check.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include <ctype.h>
 #include <math.h>
-#include <stdio.h>
-#include <time.h>
 
 #define BYTES_TO_KB(bytes) ((uint32_t)((bytes) / 1024))
 #define BYTES_TO_MB(bytes) ((uint32_t)((bytes) / (1024 * 1024)))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 static const char *TAG = "super-potato";
+
+void heap_alloc_failed_hook(size_t requested_size, uint32_t caps,
+                            const char *function_name) {
+  ESP_LOGE(TAG,
+           "%s failed to allocate %" PRIu32 " KB (free heap size: %" PRIu32
+           " KB)",
+           function_name, BYTES_TO_KB(requested_size),
+           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
+}
 
 // Copied from https://github.com/karpathy/llama2.c
 // ----------------------------------------------------------------------------
@@ -28,27 +36,28 @@ typedef struct {
                   // multiquery)
   int vocab_size; // vocabulary size, usually 256 (byte-level)
   int seq_len;    // max sequence length
+  int shared_weights;
 } Config;
 
 typedef struct {
   // token embedding table
-  float *token_embedding_table; // (vocab_size, dim)
+  const float *token_embedding_table; // (vocab_size, dim)
   // weights for rmsnorms
-  float *rms_att_weight; // (layer, dim) rmsnorm weights
-  float *rms_ffn_weight; // (layer, dim)
+  const float *rms_att_weight; // (layer, dim) rmsnorm weights
+  const float *rms_ffn_weight; // (layer, dim)
   // weights for matmuls. note dim == n_heads * head_size
-  float *wq; // (layer, dim, n_heads * head_size)
-  float *wk; // (layer, dim, n_kv_heads * head_size)
-  float *wv; // (layer, dim, n_kv_heads * head_size)
-  float *wo; // (layer, n_heads * head_size, dim)
+  const float *wq; // (layer, dim, n_heads * head_size)
+  const float *wk; // (layer, dim, n_kv_heads * head_size)
+  const float *wv; // (layer, dim, n_kv_heads * head_size)
+  const float *wo; // (layer, n_heads * head_size, dim)
   // weights for ffn
-  float *w1; // (layer, hidden_dim, dim)
-  float *w2; // (layer, dim, hidden_dim)
-  float *w3; // (layer, hidden_dim, dim)
+  const float *w1; // (layer, hidden_dim, dim)
+  const float *w2; // (layer, dim, hidden_dim)
+  const float *w3; // (layer, hidden_dim, dim)
   // final rmsnorm
-  float *rms_final_weight; // (dim,)
+  const float *rms_final_weight; // (dim,)
   // (optional) classifier weights for the logits, on the last layer
-  float *wcls;
+  const float *wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -72,14 +81,9 @@ typedef struct {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   RunState state; // buffers for the "wave" of activations in the forward pass
-  // some more state needed to properly clean up the memory mapping (sigh)
-  int fd;            // file descriptor for memory mapping
-  float *data;       // memory mapped data pointer
-  ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
 void malloc_run_state(RunState *s, Config *p) {
-  // we calloc instead of malloc to keep valgrind happy
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
   s->x = calloc(p->dim, sizeof(float));
   s->xb = calloc(p->dim, sizeof(float));
@@ -91,12 +95,6 @@ void malloc_run_state(RunState *s, Config *p) {
   s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
   s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
   s->logits = calloc(p->vocab_size, sizeof(float));
-  // ensure all mallocs went fine
-  if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
-      !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-    fprintf(stderr, "malloc failed!\n");
-    exit(EXIT_FAILURE);
-  }
 }
 
 void free_run_state(RunState *s) {
@@ -112,8 +110,7 @@ void free_run_state(RunState *s) {
   free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
-                        int shared_weights) {
+void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr) {
   int head_size = p->dim / p->n_heads;
   // make sure the multiplications below are done in 64bit to fit the parameter
   // counts of 13B+ models
@@ -140,11 +137,11 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
   ptr += n_layers * p->dim * p->hidden_dim;
   w->rms_final_weight = ptr;
   ptr += p->dim;
-  ptr += p->seq_len * head_size /
-         2; // skip what used to be freq_cis_real (for RoPE)
-  ptr += p->seq_len * head_size /
-         2; // skip what used to be freq_cis_imag (for RoPE)
-  w->wcls = shared_weights ? w->token_embedding_table : ptr;
+  // skip what used to be freq_cis_real (for RoPE)
+  ptr += p->seq_len * head_size / 2;
+  // skip what used to be freq_cis_imag (for RoPE)
+  ptr += p->seq_len * head_size / 2;
+  w->wcls = p->shared_weights ? w->token_embedding_table : ptr;
 }
 
 // void read_checkpoint(char *checkpoint, Config *config,
@@ -159,8 +156,6 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
 //   if (fread(config, sizeof(Config), 1, file) != 1) {
 //     exit(EXIT_FAILURE);
 //   }
-//   // negative vocab size is hacky way of signaling unshared weights. bit
-//   yikes. int shared_weights = config->vocab_size > 0 ? 1 : 0;
 //   config->vocab_size = abs(config->vocab_size);
 //   // figure out the file size
 //   fseek(file, 0, SEEK_END); // move file pointer to end of file
@@ -178,21 +173,13 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
 //     exit(EXIT_FAILURE);
 //   }
 //   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
-//   memory_map_weights(weights, config, weights_ptr, shared_weights);
+//   memory_map_weights(weights, config, weights_ptr, config->shared_weights);
 // }
-
-void build_transformer(Transformer *t, char *checkpoint_path) {
-  // read in the Config and the Weights from the checkpoint
-  // read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data,
-  //                 &t->file_size);
-  // allocate the RunState buffers
-  malloc_run_state(&t->state, &t->config);
-}
 
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-void rmsnorm(float *o, float *x, float *weight, int size) {
+void rmsnorm(float *o, float *x, const float *weight, int size) {
   // calculate sum of squares
   float ss = 0.0f;
   for (int j = 0; j < size; j++)
@@ -225,7 +212,7 @@ void softmax(float *x, int size) {
   }
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
+void matmul(float *xout, float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   int i;
@@ -240,7 +227,6 @@ void matmul(float *xout, float *x, float *w, int n, int d) {
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
-
   // a few convenience variables
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
@@ -248,14 +234,13 @@ float *forward(Transformer *transformer, int token, int pos) {
   float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  int kv_mul =
-      p->n_heads /
-      p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+  // integer multiplier of the kv sharing in multiquery
+  int kv_mul = p->n_heads / p->n_kv_heads;
   int hidden_dim = p->hidden_dim;
   int head_size = dim / p->n_heads;
 
   // copy the token embedding into x
-  float *content_row = w->token_embedding_table + token * dim;
+  const float *content_row = w->token_embedding_table + token * dim;
   memcpy(x, content_row, dim * sizeof(*x));
 
   // forward all the layers
@@ -284,8 +269,8 @@ float *forward(Transformer *transformer, int token, int pos) {
       float fci = sinf(val);
       int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
       for (int v = 0; v < rotn; v++) {
-        float *vec =
-            v == 0 ? s->q : s->k; // the vector to rotate (query or key)
+        // the vector to rotate (query or key)
+        float *vec = v == 0 ? s->q : s->k;
         float v0 = vec[i];
         float v1 = vec[i + 1];
         vec[i] = v0 * fcr - v1 * fci;
@@ -381,132 +366,66 @@ float *forward(Transformer *transformer, int token, int pos) {
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
 typedef struct {
-  char *str;
+  float score;
+  int length;
+  // Not null terminated
+  char string[];
+} Vocab;
+
+typedef struct {
+  const Vocab *vocab;
   int id;
 } TokenIndex;
 
 typedef struct {
-  char **vocab;
-  float *vocab_scores;
-  TokenIndex *sorted_vocab;
-  int vocab_size;
   unsigned int max_token_length;
-  unsigned char byte_pieces[512]; // stores all single-byte strings
+  Vocab vocabs[];
 } Tokenizer;
 
 int compare_tokens(const void *a, const void *b) {
-  return strcmp(((TokenIndex *)a)->str, ((TokenIndex *)b)->str);
+  const TokenIndex *token_a = (const TokenIndex *)a;
+  const TokenIndex *token_b = (const TokenIndex *)b;
+  return strncmp(token_a->vocab->string, token_b->vocab->string,
+                 MIN(token_a->vocab->length, token_b->vocab->length));
 }
 
-void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
-  // i should have written the vocab_size into the tokenizer file... sigh
-  t->vocab_size = vocab_size;
-  // malloc space to hold the scores and the strings
-  t->vocab = (char **)malloc(vocab_size * sizeof(char *));
-  t->vocab_scores = (float *)malloc(vocab_size * sizeof(float));
-  t->sorted_vocab = NULL; // initialized lazily
-  for (int i = 0; i < 256; i++) {
-    t->byte_pieces[i * 2] = (unsigned char)i;
-    t->byte_pieces[i * 2 + 1] = '\0';
-  }
-  // read in the file
-  // FILE *file = fopen(tokenizer_path, "rb");
-  // if (!file) {
-  //   fprintf(stderr, "couldn't load %s\n", tokenizer_path);
-  //   exit(EXIT_FAILURE);
-  // }
-  // if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) {
-  //   fprintf(stderr, "failed read\n");
-  //   exit(EXIT_FAILURE);
-  // }
-  // int len;
-  // for (int i = 0; i < vocab_size; i++) {
-  //   if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) {
-  //     fprintf(stderr, "failed read\n");
-  //     exit(EXIT_FAILURE);
-  //   }
-  //   if (fread(&len, sizeof(int), 1, file) != 1) {
-  //     fprintf(stderr, "failed read\n");
-  //     exit(EXIT_FAILURE);
-  //   }
-  //   t->vocab[i] = (char *)malloc(len + 1);
-  //   if (fread(t->vocab[i], len, 1, file) != 1) {
-  //     fprintf(stderr, "failed read\n");
-  //     exit(EXIT_FAILURE);
-  //   }
-  //   t->vocab[i][len] = '\0'; // add the string terminating token
-  // }
-  // fclose(file);
-}
-
-void free_tokenizer(Tokenizer *t) {
-  for (int i = 0; i < t->vocab_size; i++)
-    free(t->vocab[i]);
-  free(t->vocab);
-  free(t->vocab_scores);
-  free(t->sorted_vocab);
-}
-
-char *decode(Tokenizer *t, int prev_token, int token) {
-  char *piece = t->vocab[token];
+void decode_and_print(const Tokenizer *t, int prev_token, int token) {
+  const Vocab *v = &t->vocabs[token];
+  int length = v->length;
+  const char *piece = v->string;
   // following BOS (1) token, sentencepiece decoder strips any leading
   // whitespace (see PR #89)
-  if (prev_token == 1 && piece[0] == ' ') {
-    piece++;
-  }
-  // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-  // parse this and convert and return the actual byte
-  unsigned char byte_val;
-  if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
-    piece = (char *)t->byte_pieces + byte_val * 2;
-  }
-  return piece;
-}
-
-void safe_printf(char *piece) {
-  // piece might be a raw byte token, and we only want to print printable chars
-  // or whitespace because some of the other bytes can be various control codes,
-  // backspace, etc.
-  if (piece == NULL) {
-    return;
-  }
-  if (piece[0] == '\0') {
-    return;
-  }
-  if (piece[1] == '\0') {
-    unsigned char byte_val = piece[0];
-    if (!(isprint(byte_val) || isspace(byte_val))) {
-      return; // bad byte, don't print it
+  if (prev_token == 1) {
+    while (length && piece[0] == ' ') {
+      piece++;
+      length--;
     }
   }
-  printf("%s", piece);
+  if (!length)
+    return;
+  // TODO: Some tokens look like <0x01> and I don't care
+  printf("%.*s", length, piece);
+  fflush(stdout);
 }
 
-int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
-  // efficiently find the perfect match for str in vocab, return its index or -1
-  // if not found
-  TokenIndex tok = {.str = str}; // acts as the key to search for
+int str_lookup(char *str, int length, TokenIndex *sorted_vocab,
+               int vocab_size) {
+  Vocab v;
+  v.length = length;
+  memcpy(v.string, str, length);
+  TokenIndex tok;
+  tok.vocab = &v;
   TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex),
                             compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
-void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
-            int *n_tokens) {
+void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
+            char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
   // encode the string text (input) into an upper-bound preallocated tokens[]
   // array bos != 0 means prepend the BOS token (=1), eos != 0 means append the
   // EOS token (=2)
   assert(text);
-
-  if (t->sorted_vocab == NULL) {
-    // lazily malloc and sort the vocabulary
-    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
-    for (int i = 0; i < t->vocab_size; i++) {
-      t->sorted_vocab[i].str = t->vocab[i];
-      t->sorted_vocab[i].id = i;
-    }
-    qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
-  }
 
   // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
@@ -521,13 +440,13 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
   if (bos)
     tokens[(*n_tokens)++] = 1;
 
-  // add_dummy_prefix is true by default
-  // so prepend a dummy prefix token to the input string, but only if text != ""
-  // TODO: pretty sure this isn't correct in the general case but I don't have
-  // the energy to read more of the sentencepiece code to figure out what it's
-  // doing
+  // add_dummy_prefix is true by default so prepend a dummy prefix token to the
+  // input string, but only if text != ""
+  // TODO: pretty sure this isn't correct in the general case but I don't
+  // have the energy to read more of the sentencepiece code to figure out
+  // what it's doing
   if (text[0] != '\0') {
-    int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+    int dummy_prefix = str_lookup(" ", /*length=*/1, sorted_vocab, vocab_size);
     tokens[(*n_tokens)++] = dummy_prefix;
   }
 
@@ -537,7 +456,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
   // U+0000	U+007F	    0xxxxxxx
   // U+0080	U+07FF	    110xxxxx	10xxxxxx
   // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
-  // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+  // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx 10xxxxxx
 
   // process the raw (UTF-8) byte sequence of the input string
   for (char *c = text; *c != '\0'; c++) {
@@ -555,8 +474,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
     }
 
     // append the current byte to the buffer
-    str_buffer[str_len++] =
-        *c; // ++ is post-increment, incremented after this line
+    str_buffer[str_len++] = *c;
     str_buffer[str_len] = '\0';
 
     // while the next character is a continuation byte, continue appending
@@ -567,14 +485,14 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
     }
 
     // ok c+1 is not a continuation byte, so we've read in a full codepoint
-    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+    int id = str_lookup(str_buffer, str_len, sorted_vocab, vocab_size);
 
     if (id != -1) {
       // we found this codepoint in vocab, add it as a token
       tokens[(*n_tokens)++] = id;
     } else {
       // byte_fallback encoding: just encode each byte as a token
-      // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+      // +3 is here because the first 3 vocab elements are <unk>, <s>, </ s>
       // so the individual bytes only start at index 3
       for (int i = 0; i < str_len; i++) {
         tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
@@ -591,15 +509,18 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
     int best_idx = -1;
 
     for (int i = 0; i < (*n_tokens - 1); i++) {
+      // TODO
+      /*
       // check if we can merge the pair (tokens[i], tokens[i+1])
       sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
-      int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+      int id = str_lookup(str_buffer, str_len, sorted_vocab, vocab_size);
       if (id != -1 && t->vocab_scores[id] > best_score) {
         // this merge pair exists in vocab! record its score and position
         best_score = t->vocab_scores[id];
         best_id = id;
         best_idx = i;
       }
+      */
     }
 
     if (best_idx == -1) {
@@ -772,13 +693,15 @@ int sample(Sampler *sampler, float *logits) {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-              char *prompt, int steps) {
+void generate(Transformer *transformer, const Tokenizer *tokenizer,
+              TokenIndex *sorted_vocab, Sampler *sampler, char *prompt,
+              int steps) {
   // encode the (string) prompt into tokens sequence
   int num_prompt_tokens = 0;
   // +3 for '\0', ?BOS, ?EOS
   int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
-  encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+  encode(tokenizer, sorted_vocab, transformer->config.vocab_size, prompt,
+         /*bos=*/1, /*eos=*/0, prompt_tokens, &num_prompt_tokens);
   assert(num_prompt_tokens > 0);
 
   // start the main loop
@@ -808,9 +731,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
       break;
 
     // print the token as string, decode it with the Tokenizer object
-    char *piece = decode(tokenizer, token, next);
-    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-    fflush(stdout);
+    decode_and_print(tokenizer, token, next);
     token = next;
 
     // init the timer here because the first iteration can be slower
@@ -830,21 +751,43 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   free(prompt_tokens);
 }
 
-void run_with_model(const char *model_data, size_t model_size,
-                    const char *tokenizer_data, size_t tokenizer_size) {
-  for (size_t i = 0; i < 100; i++)
-    printf("%c %c", model_data[i], tokenizer_data[i]);
-  printf("\n");
+void build_transformer(Transformer *transformer, const void *model_data) {
+  memcpy(&transformer->config, model_data, sizeof(Config));
+  transformer->config.shared_weights = transformer->config.vocab_size > 0;
+  transformer->config.vocab_size = transformer->config.vocab_size;
+  memory_map_weights(&transformer->weights, &transformer->config,
+                     (const float *)(model_data + sizeof(Config)));
+  // allocate the RunState buffers
+  malloc_run_state(&transformer->state, &transformer->config);
+}
 
-  // TODO
+void run_with_model(const void *model_data, const void *tokenizer_data) {
   Transformer transformer;
-  Tokenizer tokenizer;
-  Sampler sampler;
+  build_transformer(&transformer, model_data);
 
-  generate(&transformer, &tokenizer, &sampler, "Hello world", 100);
+  const Tokenizer *tokenizer = (const Tokenizer *)tokenizer_data;
+  // Init
+  TokenIndex *sorted_vocab =
+      malloc(transformer.config.vocab_size * sizeof(TokenIndex));
+  for (int i = 0; i < transformer.config.vocab_size; i++) {
+    sorted_vocab[i].vocab = &tokenizer->vocabs[i];
+    sorted_vocab[i].id = i;
+  }
+  qsort(sorted_vocab, transformer.config.vocab_size, sizeof(TokenIndex),
+        compare_tokens);
+
+  Sampler sampler;
+  build_sampler(&sampler, transformer.config.vocab_size, /*Temperature=*/1.f,
+                /*TopP=*/0.9f, /*Seed=*/101);
+
+  generate(&transformer, tokenizer, sorted_vocab, &sampler, "Hello world", 100);
+  free(sorted_vocab);
 }
 
 esp_err_t run(void) {
+  ESP_RETURN_ON_ERROR(
+      heap_caps_register_failed_alloc_callback(heap_alloc_failed_hook), TAG,
+      "Failed to register heap allocation failed callback");
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
 
@@ -864,7 +807,7 @@ esp_err_t run(void) {
                       "Partition model not found");
 
   esp_partition_mmap_handle_t map_handle;
-  const char *model_data;
+  const void *model_data;
   ESP_RETURN_ON_ERROR(
       esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA,
                          (const void **)&model_data, &map_handle),
@@ -877,7 +820,7 @@ esp_err_t run(void) {
                                        ESP_PARTITION_SUBTYPE_ANY, "tokenizer");
   ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG,
                       "Partition tokenizer not found");
-  const char *tokenizer_data;
+  const void *tokenizer_data;
   ESP_RETURN_ON_ERROR(
       esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA,
                          (const void **)&tokenizer_data, &map_handle),
@@ -886,7 +829,10 @@ esp_err_t run(void) {
   ESP_LOGI(TAG, "tokenizer mmaped at %p with size %" PRIu32 " MB",
            tokenizer_data, BYTES_TO_MB(tokenizer_size));
 
-  run_with_model(model_data, model_size, tokenizer_data, tokenizer_size);
+  run_with_model(model_data, tokenizer_data);
+
+  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
+           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
   return ESP_OK;
 }
 
