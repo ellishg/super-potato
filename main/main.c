@@ -144,38 +144,6 @@ void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr) {
   w->wcls = p->shared_weights ? w->token_embedding_table : ptr;
 }
 
-// void read_checkpoint(char *checkpoint, Config *config,
-//                      TransformerWeights *weights, int *fd, float **data,
-//                      ssize_t *file_size) {
-//   FILE *file = fopen(checkpoint, "rb");
-//   if (!file) {
-//     fprintf(stderr, "Couldn't open file %s\n", checkpoint);
-//     exit(EXIT_FAILURE);
-//   }
-//   // read in the config header
-//   if (fread(config, sizeof(Config), 1, file) != 1) {
-//     exit(EXIT_FAILURE);
-//   }
-//   config->vocab_size = abs(config->vocab_size);
-//   // figure out the file size
-//   fseek(file, 0, SEEK_END); // move file pointer to end of file
-//   *file_size = ftell(file); // get the file size, in bytes
-//   fclose(file);
-//   // memory map the Transformer weights into the data pointer
-//   *fd = open(checkpoint, O_RDONLY); // open in read only mode
-//   if (*fd == -1) {
-//     fprintf(stderr, "open failed!\n");
-//     exit(EXIT_FAILURE);
-//   }
-//   *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-//   if (*data == MAP_FAILED) {
-//     fprintf(stderr, "mmap failed!\n");
-//     exit(EXIT_FAILURE);
-//   }
-//   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
-//   memory_map_weights(weights, config, weights_ptr, config->shared_weights);
-// }
-
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
@@ -368,8 +336,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 typedef struct {
   float score;
   int length;
-  // Not null terminated
-  char string[];
+  const char *string;
 } Vocab;
 
 typedef struct {
@@ -379,14 +346,37 @@ typedef struct {
 
 typedef struct {
   unsigned int max_token_length;
-  Vocab vocabs[];
+  Vocab *vocabs;
 } Tokenizer;
+
+void build_tokenizer(Tokenizer *tokenizer, const void *tokenizer_data,
+                     int vocab_size) {
+  const uint8_t *data = tokenizer_data;
+  memcpy(&tokenizer->max_token_length, data,
+         sizeof(tokenizer->max_token_length));
+  data += sizeof(tokenizer->max_token_length);
+  tokenizer->vocabs = calloc(vocab_size, sizeof(Vocab));
+
+  for (int i = 0; i < vocab_size; i++) {
+    memcpy(&tokenizer->vocabs[i].score, data, sizeof(float));
+    data += sizeof(float);
+    memcpy(&tokenizer->vocabs[i].length, data, sizeof(int));
+    data += sizeof(int);
+    tokenizer->vocabs[i].string = (const char *)data;
+    data += tokenizer->vocabs[i].length;
+  }
+}
+
+void free_tokenizer(Tokenizer *tokenizer) { free(tokenizer->vocabs); }
 
 int compare_tokens(const void *a, const void *b) {
   const TokenIndex *token_a = (const TokenIndex *)a;
   const TokenIndex *token_b = (const TokenIndex *)b;
-  return strncmp(token_a->vocab->string, token_b->vocab->string,
-                 MIN(token_a->vocab->length, token_b->vocab->length));
+  int length = MIN(token_a->vocab->length, token_b->vocab->length);
+  int result = memcmp(token_a->vocab->string, token_b->vocab->string, length);
+  if (result != 0)
+    return result;
+  return token_a->vocab->length - token_b->vocab->length;
 }
 
 void decode_and_print(const Tokenizer *t, int prev_token, int token) {
@@ -403,7 +393,17 @@ void decode_and_print(const Tokenizer *t, int prev_token, int token) {
   }
   if (!length)
     return;
-  // TODO: Some tokens look like <0x01> and I don't care
+
+  // Convert tokenizer byte markers such as <0xA5> back to their raw byte.
+  if (length == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' &&
+      piece[5] == '>') {
+    unsigned int byte_value;
+    if (sscanf(piece + 3, "%02x", &byte_value) == 1) {
+      putchar((unsigned char)byte_value);
+      fflush(stdout);
+      return;
+    }
+  }
   printf("%.*s", length, piece);
   fflush(stdout);
 }
@@ -412,7 +412,7 @@ int str_lookup(char *str, int length, TokenIndex *sorted_vocab,
                int vocab_size) {
   Vocab v;
   v.length = length;
-  memcpy(v.string, str, length);
+  v.string = str;
   TokenIndex tok;
   tok.vocab = &v;
   TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex),
@@ -509,18 +509,18 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
     int best_idx = -1;
 
     for (int i = 0; i < (*n_tokens - 1); i++) {
-      // TODO
-      /*
       // check if we can merge the pair (tokens[i], tokens[i+1])
-      sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+      const Vocab *v1 = &t->vocabs[tokens[i]];
+      const Vocab *v2 = &t->vocabs[tokens[i + 1]];
+      sprintf(str_buffer, "%.*s%.*s", v1->length, v1->string, v2->length,
+              v2->string);
       int id = str_lookup(str_buffer, str_len, sorted_vocab, vocab_size);
-      if (id != -1 && t->vocab_scores[id] > best_score) {
+      if (id != -1 && t->vocabs[id].score > best_score) {
         // this merge pair exists in vocab! record its score and position
-        best_score = t->vocab_scores[id];
+        best_score = t->vocabs[id].score;
         best_id = id;
         best_idx = i;
       }
-      */
     }
 
     if (best_idx == -1) {
@@ -765,12 +765,13 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
   Transformer transformer;
   build_transformer(&transformer, model_data);
 
-  const Tokenizer *tokenizer = (const Tokenizer *)tokenizer_data;
+  Tokenizer tokenizer;
+  build_tokenizer(&tokenizer, tokenizer_data, transformer.config.vocab_size);
   // Init
   TokenIndex *sorted_vocab =
       malloc(transformer.config.vocab_size * sizeof(TokenIndex));
   for (int i = 0; i < transformer.config.vocab_size; i++) {
-    sorted_vocab[i].vocab = &tokenizer->vocabs[i];
+    sorted_vocab[i].vocab = &tokenizer.vocabs[i];
     sorted_vocab[i].id = i;
   }
   qsort(sorted_vocab, transformer.config.vocab_size, sizeof(TokenIndex),
@@ -780,8 +781,10 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
   build_sampler(&sampler, transformer.config.vocab_size, /*Temperature=*/1.f,
                 /*TopP=*/0.9f, /*Seed=*/101);
 
-  generate(&transformer, tokenizer, sorted_vocab, &sampler, "Hello world", 100);
+  generate(&transformer, &tokenizer, sorted_vocab, &sampler, "Hello world",
+           100);
   free(sorted_vocab);
+  free_tokenizer(&tokenizer);
 }
 
 esp_err_t run(void) {
