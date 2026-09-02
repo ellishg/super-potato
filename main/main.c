@@ -36,7 +36,6 @@ typedef struct {
                   // multiquery)
   int vocab_size; // vocabulary size, usually 256 (byte-level)
   int seq_len;    // max sequence length
-  int shared_weights;
 } Config;
 
 typedef struct {
@@ -110,7 +109,8 @@ void free_run_state(RunState *s) {
   free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr) {
+void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr,
+                        int shared_weights) {
   int head_size = p->dim / p->n_heads;
   // make sure the multiplications below are done in 64bit to fit the parameter
   // counts of 13B+ models
@@ -141,7 +141,7 @@ void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr) {
   ptr += p->seq_len * head_size / 2;
   // skip what used to be freq_cis_imag (for RoPE)
   ptr += p->seq_len * head_size / 2;
-  w->wcls = p->shared_weights ? w->token_embedding_table : ptr;
+  w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
 // ----------------------------------------------------------------------------
@@ -753,10 +753,11 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
 
 void build_transformer(Transformer *transformer, const void *model_data) {
   memcpy(&transformer->config, model_data, sizeof(Config));
-  transformer->config.shared_weights = transformer->config.vocab_size > 0;
-  transformer->config.vocab_size = transformer->config.vocab_size;
+  int shared_weights = transformer->config.vocab_size > 0;
+  transformer->config.vocab_size = abs(transformer->config.vocab_size);
   memory_map_weights(&transformer->weights, &transformer->config,
-                     (const float *)(model_data + sizeof(Config)));
+                     (const float *)(model_data + sizeof(Config)),
+                     shared_weights);
   // allocate the RunState buffers
   malloc_run_state(&transformer->state, &transformer->config);
 }
