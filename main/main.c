@@ -473,6 +473,9 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
       str_len = 0;
     }
 
+    if (str_len >= 4)
+      str_len = 0;
+
     // append the current byte to the buffer
     str_buffer[str_len++] = *c;
     str_buffer[str_len] = '\0';
@@ -512,9 +515,10 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
       // check if we can merge the pair (tokens[i], tokens[i+1])
       const Vocab *v1 = &t->vocabs[tokens[i]];
       const Vocab *v2 = &t->vocabs[tokens[i + 1]];
+      size_t merge_len = v1->length + v2->length;
       sprintf(str_buffer, "%.*s%.*s", v1->length, v1->string, v2->length,
               v2->string);
-      int id = str_lookup(str_buffer, str_len, sorted_vocab, vocab_size);
+      int id = str_lookup(str_buffer, merge_len, sorted_vocab, vocab_size);
       if (id != -1 && t->vocabs[id].score > best_score) {
         // this merge pair exists in vocab! record its score and position
         best_score = t->vocabs[id].score;
@@ -782,8 +786,10 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
   build_sampler(&sampler, transformer.config.vocab_size, /*Temperature=*/1.f,
                 /*TopP=*/0.9f, /*Seed=*/101);
 
-  generate(&transformer, &tokenizer, sorted_vocab, &sampler, "Hello world",
-           100);
+  generate(&transformer, &tokenizer, sorted_vocab, &sampler,
+           "Tell me a quick story.", MIN(200, transformer.config.seq_len));
+  free_sampler(&sampler);
+  free_run_state(&transformer.state);
   free(sorted_vocab);
   free_tokenizer(&tokenizer);
 }
@@ -810,11 +816,11 @@ esp_err_t run(void) {
   ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG,
                       "Partition model not found");
 
-  esp_partition_mmap_handle_t map_handle;
+  esp_partition_mmap_handle_t model_map_handle;
   const void *model_data;
   ESP_RETURN_ON_ERROR(
       esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA,
-                         (const void **)&model_data, &map_handle),
+                         (const void **)&model_data, &model_map_handle),
       TAG, "Failed to mmap model");
   size_t model_size = partition->size;
   ESP_LOGI(TAG, "model mmaped at %p with size %" PRIu32 " MB", model_data,
@@ -824,16 +830,21 @@ esp_err_t run(void) {
                                        ESP_PARTITION_SUBTYPE_ANY, "tokenizer");
   ESP_RETURN_ON_FALSE(partition, ESP_ERR_NOT_FOUND, TAG,
                       "Partition tokenizer not found");
+
+  esp_partition_mmap_handle_t tokenizer_map_handle;
   const void *tokenizer_data;
   ESP_RETURN_ON_ERROR(
       esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA,
-                         (const void **)&tokenizer_data, &map_handle),
+                         (const void **)&tokenizer_data, &tokenizer_map_handle),
       TAG, "Failed to mmap tokenizer");
   size_t tokenizer_size = partition->size;
   ESP_LOGI(TAG, "tokenizer mmaped at %p with size %" PRIu32 " MB",
            tokenizer_data, BYTES_TO_MB(tokenizer_size));
 
   run_with_model(model_data, tokenizer_data);
+
+  esp_partition_munmap(model_map_handle);
+  esp_partition_munmap(tokenizer_map_handle);
 
   ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
            BYTES_TO_KB(esp_get_minimum_free_heap_size()));
