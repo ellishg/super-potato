@@ -15,6 +15,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 0.140869
+  * CONFIG_COMPILER_OPTIMIZATION_PERF=y
 * achieved tok/s: 0.139544
   * Switched to clang toolchain
 * achieved tok/s: 0.085500
