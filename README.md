@@ -15,6 +15,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 0.182286
+  * Unroll loop
 * achieved tok/s: 0.141573
   * -ffast-math
 * achieved tok/s: 0.140869
