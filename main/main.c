@@ -6,6 +6,7 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "utf8proc.h"
 #include <math.h>
 
 #define BYTES_TO_KB(bytes) ((uint32_t)((bytes) / 1024))
@@ -450,45 +451,17 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
     tokens[(*n_tokens)++] = dummy_prefix;
   }
 
-  // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
-  // Code point ↔ UTF-8 conversion
-  // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
-  // U+0000	U+007F	    0xxxxxxx
-  // U+0080	U+07FF	    110xxxxx	10xxxxxx
-  // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
-  // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx 10xxxxxx
-
   // process the raw (UTF-8) byte sequence of the input string
-  for (char *c = text; *c != '\0'; c++) {
-
-    // reset buffer if the current byte is ASCII or a leading byte
-    // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the
-    // rest 0x80 is 10000000 in UTF-8, all continuation bytes start with "10" in
-    // first two bits so in English this is: "if this byte is not a continuation
-    // byte"
-    if ((*c & 0xC0) != 0x80) {
-      // this byte must be either a leading byte (11...) or an ASCII char
-      // (0x...)
-      // => reset our location, as we're starting a new UTF-8 codepoint
-      str_len = 0;
+  for (size_t offset = 0; text[offset] != '\0';) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t codepoint_length = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset, -1, &codepoint);
+    if (codepoint_length < 0) {
+      codepoint_length = 1;
     }
 
-    if (str_len >= 4)
-      str_len = 0;
-
-    // append the current byte to the buffer
-    str_buffer[str_len++] = *c;
-    str_buffer[str_len] = '\0';
-
-    // while the next character is a continuation byte, continue appending
-    // but if there are too many of them, just stop to avoid overruning
-    // str_buffer size.
-    if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
-      continue;
-    }
-
-    // ok c+1 is not a continuation byte, so we've read in a full codepoint
-    int id = str_lookup(str_buffer, str_len, sorted_vocab, vocab_size);
+    int id =
+        str_lookup(text + offset, codepoint_length, sorted_vocab, vocab_size);
 
     if (id != -1) {
       // we found this codepoint in vocab, add it as a token
@@ -497,11 +470,11 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
       // byte_fallback encoding: just encode each byte as a token
       // +3 is here because the first 3 vocab elements are <unk>, <s>, </ s>
       // so the individual bytes only start at index 3
-      for (int i = 0; i < str_len; i++) {
-        tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+      for (int i = 0; i < codepoint_length; i++) {
+        tokens[(*n_tokens)++] = (unsigned char)text[offset + i] + 3;
       }
     }
-    str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
+    offset += codepoint_length;
   }
 
   // merge the best consecutive pair each iteration, according the scores in
