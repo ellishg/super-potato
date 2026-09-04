@@ -24,3 +24,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 * achieved tok/s: 0.139544
   * Switched to clang toolchain
 * achieved tok/s: 0.085500
+
+# Useful Links
+* https://github.com/karpathy/llama2.c
+* https://github.com/slvDev/esp32-ai
+* https://github.com/espressif/esp-idf
