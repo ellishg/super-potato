@@ -15,15 +15,15 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
-* achieved tok/s: 0.182286
+* achieved tok/s: 182.286
   * Unroll loop
-* achieved tok/s: 0.141573
+* achieved tok/s: 141.573
   * -ffast-math
-* achieved tok/s: 0.140869
+* achieved tok/s: 140.869
   * CONFIG_COMPILER_OPTIMIZATION_PERF=y
-* achieved tok/s: 0.139544
+* achieved tok/s: 139.544
   * Switched to clang toolchain
-* achieved tok/s: 0.085500
+* achieved tok/s: 85.500
 
 # Useful Links
 * https://github.com/karpathy/llama2.c

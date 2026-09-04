@@ -432,7 +432,6 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
   char *str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
-  size_t str_len = 0;
 
   // start at 0 tokens
   *n_tokens = 0;
@@ -683,7 +682,7 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
 
   // start the main loop
   // used to time our code, only initialized after first iteration
-  long start = 0;
+  int64_t start = 0;
   int next;                     // will store the next token in the sequence
   int token = prompt_tokens[0]; // kick off with the first token in the prompt
   int pos = 0;                  // position in the sequence
@@ -720,9 +719,9 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
   // report achieved tok/s (pos-1 because the timer starts after first
   // iteration)
   if (pos > 1) {
-    long end = esp_timer_get_time();
+    int64_t end = esp_timer_get_time();
     ESP_LOGI(TAG, "achieved tok/s: %f\n",
-             (pos - 1) / (double)(end - start) * 1000);
+             (pos - 1) / (double)(end - start) * 1e6);
   }
 
   free(prompt_tokens);
