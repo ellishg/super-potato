@@ -2,5 +2,5 @@
 nvs,       data, nvs,     0x9000,  0x6000,
 phy_init,  data, phy,     0xf000,  0x1000,
 factory,   app,  factory, 0x10000, 600K,
-tokenizer, data, ,        ,        300K,
-model,     data, ,        ,        15M,
+tokenizer, data, ,        ,        460K,
+model,     data, ,        ,        14900K,

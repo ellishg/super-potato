@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "utf8proc.h"
 #include <math.h>
@@ -14,21 +15,27 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 static const char *TAG = "super-potato";
+int GS = 0; // group size global for quantization of the weights
 
 void heap_alloc_failed_hook(size_t requested_size, uint32_t caps,
                             const char *function_name) {
   ESP_LOGE(TAG,
-           "%s failed to allocate %" PRIu32 " KB (free heap size: %" PRIu32
-           " KB)",
-           function_name, BYTES_TO_KB(requested_size),
-           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
+           "%s failed to allocate %" PRIu32 " MB (free heap size: %" PRIu32
+           " MB)",
+           function_name, BYTES_TO_MB(requested_size),
+           BYTES_TO_MB(esp_get_minimum_free_heap_size()));
+  abort();
 }
 
 // Copied from https://github.com/karpathy/llama2.c
 // ----------------------------------------------------------------------------
 // Transformer model
 
+// packed to match the on-disk header layout exactly (no compiler padding
+// between shared_classifier and group_size)
 typedef struct {
+  uint32_t magic_number;
+  int version;
   int dim;        // transformer dimension
   int hidden_dim; // for ffn layers
   int n_layers;   // number of layers
@@ -37,27 +44,35 @@ typedef struct {
                   // multiquery)
   int vocab_size; // vocabulary size, usually 256 (byte-level)
   int seq_len;    // max sequence length
-} Config;
+  uint8_t shared_classifier;
+  int group_size;
+} __attribute__((packed)) Config;
+
+typedef struct {
+  int8_t *q; // quantized values
+  float *s;  // scaling factors
+} QuantizedTensor;
 
 typedef struct {
   // token embedding table
-  const float *token_embedding_table; // (vocab_size, dim)
+  QuantizedTensor *q_tokens; // (vocab_size, dim)
+
   // weights for rmsnorms
-  const float *rms_att_weight; // (layer, dim) rmsnorm weights
-  const float *rms_ffn_weight; // (layer, dim)
+  float *rms_att_weight; // (layer, dim) rmsnorm weights
+  float *rms_ffn_weight; // (layer, dim)
   // weights for matmuls. note dim == n_heads * head_size
-  const float *wq; // (layer, dim, n_heads * head_size)
-  const float *wk; // (layer, dim, n_kv_heads * head_size)
-  const float *wv; // (layer, dim, n_kv_heads * head_size)
-  const float *wo; // (layer, n_heads * head_size, dim)
+  QuantizedTensor *wq; // (layer, dim, n_heads * head_size)
+  QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
+  QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
+  QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
   // weights for ffn
-  const float *w1; // (layer, hidden_dim, dim)
-  const float *w2; // (layer, dim, hidden_dim)
-  const float *w3; // (layer, hidden_dim, dim)
+  QuantizedTensor *w1; // (layer, hidden_dim, dim)
+  QuantizedTensor *w2; // (layer, dim, hidden_dim)
+  QuantizedTensor *w3; // (layer, hidden_dim, dim)
   // final rmsnorm
-  const float *rms_final_weight; // (dim,)
+  float *rms_final_weight; // (dim,)
   // (optional) classifier weights for the logits, on the last layer
-  const float *wcls;
+  QuantizedTensor *wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -67,6 +82,8 @@ typedef struct {
   float *xb2;    // an additional buffer just for convenience (dim,)
   float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
   float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
+  QuantizedTensor xq; // quantized x (dim,)
+  QuantizedTensor hq; // quantized hb (hidden_dim,)
   float *q;      // query (dim,)
   float *k;      // key (dim,)
   float *v;      // value (dim,)
@@ -78,23 +95,29 @@ typedef struct {
 } RunState;
 
 typedef struct {
-  Config config; // the hyperparameters of the architecture (the blueprint)
+  const Config *config;
   TransformerWeights weights; // the weights of the model
   RunState state; // buffers for the "wave" of activations in the forward pass
 } Transformer;
 
-void malloc_run_state(RunState *s, Config *p) {
+void malloc_run_state(RunState *s, const Config *p) {
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = calloc(p->dim, sizeof(float));
-  s->xb = calloc(p->dim, sizeof(float));
-  s->xb2 = calloc(p->dim, sizeof(float));
-  s->hb = calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = calloc(p->hidden_dim, sizeof(float));
-  s->q = calloc(p->dim, sizeof(float));
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-  s->logits = calloc(p->vocab_size, sizeof(float));
+  s->x = malloc(p->dim * sizeof(float));
+  s->xb = malloc(p->dim * sizeof(float));
+  s->xb2 = malloc(p->dim * sizeof(float));
+  s->hb = malloc(p->hidden_dim * sizeof(float));
+  s->hb2 = malloc(p->hidden_dim * sizeof(float));
+  s->xq.q = malloc(p->dim * sizeof(int8_t));
+  s->xq.s = malloc(p->dim * sizeof(float));
+  s->hq.q = malloc(p->hidden_dim * sizeof(int8_t));
+  s->hq.s = malloc(p->hidden_dim * sizeof(float));
+  s->q = malloc(p->dim * sizeof(float));
+  s->k = malloc(kv_dim * sizeof(float));
+  s->v = malloc(kv_dim * sizeof(float));
+  s->att = malloc(p->n_heads * p->seq_len * sizeof(float));
+  s->logits = malloc(p->vocab_size * sizeof(float));
+  s->key_cache = malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
+  s->value_cache = malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
 }
 
 void free_run_state(RunState *s) {
@@ -103,46 +126,101 @@ void free_run_state(RunState *s) {
   free(s->xb2);
   free(s->hb);
   free(s->hb2);
+  free(s->xq.q);
+  free(s->xq.s);
+  free(s->hq.q);
+  free(s->hq.s);
   free(s->q);
+  free(s->k);
+  free(s->v);
   free(s->att);
   free(s->logits);
   free(s->key_cache);
   free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config *p, const float *ptr,
-                        int shared_weights) {
+// ----------------------------------------------------------------------------
+// Quantization functions
+
+void quantize(QuantizedTensor *qx, float *x, int n) {
+  int num_groups = n / GS;
+  float Q_MAX = 127.0f;
+
+  for (int group = 0; group < num_groups; group++) {
+
+    // find the max absolute value in the current group
+    float wmax = 0.0;
+    for (int i = 0; i < GS; i++) {
+      float val = fabs(x[group * GS + i]);
+      if (val > wmax) {
+        wmax = val;
+      }
+    }
+
+    // calculate and write the scaling factor
+    float scale = wmax / Q_MAX;
+    qx->s[group] = scale;
+
+    // calculate and write the quantized values
+    for (int i = 0; i < GS; i++) {
+      float quant_value = x[group * GS + i] / scale; // scale
+      int8_t quantized = (int8_t)round(quant_value); // round and clamp
+      qx->q[group * GS + i] = quantized;
+    }
+  }
+}
+
+/* initialize `n` x quantized tensor (with `size_each` elements), starting from
+ * memory pointed at *ptr */
+QuantizedTensor *init_quantized_tensors(const void **ptr, int n,
+                                        int size_each) {
+  const void *p = *ptr;
+  QuantizedTensor *res = malloc(n * sizeof(QuantizedTensor));
+  for (int i = 0; i < n; i++) {
+    /* map quantized int8 values*/
+    res[i].q = (int8_t *)p;
+    p = (int8_t *)p + size_each;
+    /* map scale factors */
+    res[i].s = (float *)p;
+    p = (float *)p + size_each / GS;
+  }
+  *ptr = p; // advance ptr to current position
+  return res;
+}
+
+void memory_map_weights(TransformerWeights *w, const Config *p,
+                        const void *ptr) {
   int head_size = p->dim / p->n_heads;
-  // make sure the multiplications below are done in 64bit to fit the parameter
-  // counts of 13B+ models
-  unsigned long long n_layers = p->n_layers;
-  w->token_embedding_table = ptr;
-  ptr += p->vocab_size * p->dim;
-  w->rms_att_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->wq = ptr;
-  ptr += n_layers * p->dim * (p->n_heads * head_size);
-  w->wk = ptr;
-  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-  w->wv = ptr;
-  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-  w->wo = ptr;
-  ptr += n_layers * (p->n_heads * head_size) * p->dim;
-  w->rms_ffn_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->w1 = ptr;
-  ptr += n_layers * p->dim * p->hidden_dim;
-  w->w2 = ptr;
-  ptr += n_layers * p->hidden_dim * p->dim;
-  w->w3 = ptr;
-  ptr += n_layers * p->dim * p->hidden_dim;
-  w->rms_final_weight = ptr;
-  ptr += p->dim;
-  // skip what used to be freq_cis_real (for RoPE)
-  ptr += p->seq_len * head_size / 2;
-  // skip what used to be freq_cis_imag (for RoPE)
-  ptr += p->seq_len * head_size / 2;
-  w->wcls = shared_weights ? w->token_embedding_table : ptr;
+  // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights)
+  float *fptr = (float *)ptr; // cast our pointer to float*
+  w->rms_att_weight = fptr;
+  fptr += p->n_layers * p->dim;
+  w->rms_ffn_weight = fptr;
+  fptr += p->n_layers * p->dim;
+  w->rms_final_weight = fptr;
+  fptr += p->dim;
+
+  // now read all the quantized weights
+  ptr = (void *)fptr; // now cast the pointer back to void*
+  w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
+
+  w->wq = init_quantized_tensors(&ptr, p->n_layers,
+                                 p->dim * (p->n_heads * head_size));
+  w->wk = init_quantized_tensors(&ptr, p->n_layers,
+                                 p->dim * (p->n_kv_heads * head_size));
+  w->wv = init_quantized_tensors(&ptr, p->n_layers,
+                                 p->dim * (p->n_kv_heads * head_size));
+  w->wo = init_quantized_tensors(&ptr, p->n_layers,
+                                 (p->n_heads * head_size) * p->dim);
+
+  w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
+  w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim);
+  w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
+
+  // Force wcls to be float because it is shared with the token embedding table,
+  // which must be a float
+  assert(p->shared_classifier);
+  w->wcls = w->q_tokens;
 }
 
 // ----------------------------------------------------------------------------
@@ -181,52 +259,65 @@ void softmax(float *x, int size) {
   }
 }
 
-void matmul(float *xout, float *x, const float *w, int n, int d) {
+void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
+  // inputs to this function are both quantized
+
   int i;
+#pragma omp parallel for private(i)
   for (i = 0; i < d; i++) {
+
     float val = 0.0f;
-#pragma clang loop unroll(enable)
-    for (int j = 0; j < n; j++) {
-      val += w[i * n + j] * x[j];
+    int32_t ival = 0;
+    int in = i * n;
+
+    // do the matmul in groups of GS
+    int j;
+    // #pragma clang loop unroll(enable)
+    for (j = 0; j <= n - GS; j += GS) {
+      for (int k = 0; k < GS; k++) {
+        ival += ((int32_t)x->q[j + k]) * ((int32_t)w->q[in + j + k]);
+      }
+      val += ((float)ival) * w->s[(in + j) / GS] * x->s[j / GS];
+      ival = 0;
     }
+
     xout[i] = val;
   }
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
+
   // a few convenience variables
-  Config *p = &transformer->config;
+  const Config *p = transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
   float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  // integer multiplier of the kv sharing in multiquery
-  int kv_mul = p->n_heads / p->n_kv_heads;
+  int kv_mul =
+      p->n_heads /
+      p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int hidden_dim = p->hidden_dim;
   int head_size = dim / p->n_heads;
 
-  // copy the token embedding into x
-  const float *content_row = w->token_embedding_table + token * dim;
-  memcpy(x, content_row, dim * sizeof(*x));
+  // dequantize q_tokens into x
+  for (int i = 0; i < dim; i++)
+    x[i] = w->q_tokens->q[i + token * dim] *
+           w->q_tokens->s[(i + token * dim) / GS];
 
   // forward all the layers
-  for (unsigned long long l = 0; l < p->n_layers; l++) {
+  for (int l = 0; l < p->n_layers; l++) {
 
     // attention rmsnorm
     rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
 
-    // key and value point to the kv cache
-    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-    s->k = s->key_cache + loff + pos * kv_dim;
-    s->v = s->value_cache + loff + pos * kv_dim;
-
     // qkv matmuls for this position
-    matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-    matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
-    matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+    quantize(&s->xq, s->xb, dim);
+    matmul(s->q, &s->xq, w->wq + l, dim, dim);
+    matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
+    matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head
@@ -238,8 +329,8 @@ float *forward(Transformer *transformer, int token, int pos) {
       float fci = sinf(val);
       int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
       for (int v = 0; v < rotn; v++) {
-        // the vector to rotate (query or key)
-        float *vec = v == 0 ? s->q : s->k;
+        float *vec =
+            v == 0 ? s->q : s->k; // the vector to rotate (query or key)
         float v0 = vec[i];
         float v1 = vec[i + 1];
         vec[i] = v0 * fcr - v1 * fci;
@@ -247,9 +338,16 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
     }
 
+    // save key,value at this time step (pos) to our kv cache
+    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+    float *key_cache_row = s->key_cache + loff + pos * kv_dim;
+    float *value_cache_row = s->value_cache + loff + pos * kv_dim;
+    memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
+    memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
+
     // multihead attention. iterate over all heads
     int h;
-    // #pragma omp parallel for private(h)
+#pragma omp parallel for private(h)
     for (h = 0; h < p->n_heads; h++) {
       // get the query vector for this head
       float *q = s->q + h * head_size;
@@ -289,7 +387,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // final matmul to get the output of the attention
-    matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+    quantize(&s->xq, s->xb, dim);
+    matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
 
     // residual connection back into x
     for (int i = 0; i < dim; i++) {
@@ -301,8 +400,9 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
-    matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-    matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+    quantize(&s->xq, s->xb, dim);
+    matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
+    matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
 
     // SwiGLU non-linearity
     for (int i = 0; i < hidden_dim; i++) {
@@ -315,7 +415,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // final matmul to get the output of the ffn
-    matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+    quantize(&s->hq, s->hb, hidden_dim);
+    matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
 
     // residual connection
     for (int i = 0; i < dim; i++) {
@@ -327,7 +428,8 @@ float *forward(Transformer *transformer, int token, int pos) {
   rmsnorm(x, x, w->rms_final_weight, dim);
 
   // classifier into logits
-  matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+  quantize(&s->xq, x, dim);
+  matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
   return s->logits;
 }
 
@@ -356,7 +458,7 @@ void build_tokenizer(Tokenizer *tokenizer, const void *tokenizer_data,
   memcpy(&tokenizer->max_token_length, data,
          sizeof(tokenizer->max_token_length));
   data += sizeof(tokenizer->max_token_length);
-  tokenizer->vocabs = calloc(vocab_size, sizeof(Vocab));
+  tokenizer->vocabs = malloc(vocab_size * sizeof(Vocab));
 
   for (int i = 0; i < vocab_size; i++) {
     memcpy(&tokenizer->vocabs[i].score, data, sizeof(float));
@@ -485,12 +587,15 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
 
     for (int i = 0; i < (*n_tokens - 1); i++) {
       // check if we can merge the pair (tokens[i], tokens[i+1])
+      assert(tokens[i] >= 0 && tokens[i] < vocab_size);
+      assert(tokens[i + 1] >= 0 && tokens[i + 1] < vocab_size);
       const Vocab *v1 = &t->vocabs[tokens[i]];
       const Vocab *v2 = &t->vocabs[tokens[i + 1]];
       size_t merge_len = v1->length + v2->length;
       sprintf(str_buffer, "%.*s%.*s", v1->length, v1->string, v2->length,
               v2->string);
       int id = str_lookup(str_buffer, merge_len, sorted_vocab, vocab_size);
+      assert(id == -1 || id < vocab_size);
       if (id != -1 && t->vocabs[id].score > best_score) {
         // this merge pair exists in vocab! record its score and position
         best_score = t->vocabs[id].score;
@@ -676,7 +781,7 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
   int num_prompt_tokens = 0;
   // +3 for '\0', ?BOS, ?EOS
   int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
-  encode(tokenizer, sorted_vocab, transformer->config.vocab_size, prompt,
+  encode(tokenizer, sorted_vocab, transformer->config->vocab_size, prompt,
          /*bos=*/1, /*eos=*/0, prompt_tokens, &num_prompt_tokens);
   assert(num_prompt_tokens > 0);
 
@@ -713,6 +818,9 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
     // init the timer here because the first iteration can be slower
     if (start == 0)
       start = esp_timer_get_time();
+
+    // if (pos % 1000 == 0)
+    //   esp_task_wdt_reset();
   }
   printf("\n");
 
@@ -728,38 +836,36 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
 }
 
 void build_transformer(Transformer *transformer, const void *model_data) {
-  memcpy(&transformer->config, model_data, sizeof(Config));
-  int shared_weights = transformer->config.vocab_size > 0;
-  transformer->config.vocab_size = abs(transformer->config.vocab_size);
-  memory_map_weights(&transformer->weights, &transformer->config,
-                     (const float *)(model_data + sizeof(Config)),
-                     shared_weights);
+  transformer->config = (const Config *)model_data;
+  GS = transformer->config->group_size;
+  const int header_size = 256;
+  memory_map_weights(&transformer->weights, transformer->config,
+                     (const float *)(model_data + header_size));
   // allocate the RunState buffers
-  malloc_run_state(&transformer->state, &transformer->config);
+  malloc_run_state(&transformer->state, transformer->config);
 }
 
 void run_with_model(const void *model_data, const void *tokenizer_data) {
   Transformer transformer;
   build_transformer(&transformer, model_data);
+  const Config *p = transformer.config;
 
   Tokenizer tokenizer;
-  build_tokenizer(&tokenizer, tokenizer_data, transformer.config.vocab_size);
+  build_tokenizer(&tokenizer, tokenizer_data, p->vocab_size);
   // Init
-  TokenIndex *sorted_vocab =
-      malloc(transformer.config.vocab_size * sizeof(TokenIndex));
-  for (int i = 0; i < transformer.config.vocab_size; i++) {
+  TokenIndex *sorted_vocab = malloc(p->vocab_size * sizeof(TokenIndex));
+  for (int i = 0; i < p->vocab_size; i++) {
     sorted_vocab[i].vocab = &tokenizer.vocabs[i];
     sorted_vocab[i].id = i;
   }
-  qsort(sorted_vocab, transformer.config.vocab_size, sizeof(TokenIndex),
-        compare_tokens);
+  qsort(sorted_vocab, p->vocab_size, sizeof(TokenIndex), compare_tokens);
 
   Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, /*Temperature=*/1.f,
+  build_sampler(&sampler, p->vocab_size, /*Temperature=*/1.f,
                 /*TopP=*/0.9f, /*Seed=*/101);
 
   generate(&transformer, &tokenizer, sorted_vocab, &sampler,
-           "Tell me a quick story.", MIN(200, transformer.config.seq_len));
+           "Tell me a quick story.", MIN(200, p->seq_len));
   free_sampler(&sampler);
   free_run_state(&transformer.state);
   free(sorted_vocab);
@@ -772,6 +878,8 @@ esp_err_t run(void) {
       "Failed to register heap allocation failed callback");
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
+
+  // ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
   uint32_t flash_size;
   ESP_RETURN_ON_ERROR(esp_flash_get_size(NULL, &flash_size), TAG,

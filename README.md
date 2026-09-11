@@ -15,6 +15,10 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 3.564400
+  * New quantized 14M model
+  * https://huggingface.co/ellishg/tinyllamas/tree/main
+  * https://github.com/ellishg/llama2.c
 * achieved tok/s: 182.286
   * Unroll loop
 * achieved tok/s: 141.573
