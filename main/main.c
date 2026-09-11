@@ -5,8 +5,8 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "utf8proc.h"
 #include <math.h>
 
