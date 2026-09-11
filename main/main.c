@@ -816,11 +816,12 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
     token = next;
 
     // init the timer here because the first iteration can be slower
-    if (start == 0)
+    if (start == 0) {
       start = esp_timer_get_time();
-
-    // if (pos % 1000 == 0)
-    //   esp_task_wdt_reset();
+    } else if (esp_timer_get_time() - start > 500) {
+      // Periodically prevent the watchdog timer from triggering
+      vTaskDelay(1);
+    }
   }
   printf("\n");
 
@@ -878,8 +879,6 @@ esp_err_t run(void) {
       "Failed to register heap allocation failed callback");
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
-
-  // ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
   uint32_t flash_size;
   ESP_RETURN_ON_ERROR(esp_flash_get_size(NULL, &flash_size), TAG,

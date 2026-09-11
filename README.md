@@ -15,6 +15,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 3.502858
+  * Fix watchdog warnings
 * achieved tok/s: 3.564400
   * New quantized 14M model
   * https://huggingface.co/ellishg/tinyllamas/tree/main
