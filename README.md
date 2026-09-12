@@ -6,7 +6,21 @@ This is an attempt to run an LLM on an esp32p4. The implementation was copied fr
 Install and activate eim
 https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html
 
-# Testing
+```
+idf.py -D IDF_TOOLCHAIN=clang set-target esp32p4
+```
+
+# Building
+```
+idf.py -D IDF_TOOLCHAIN=clang build
+```
+
+# Running
+```
+idf.py flash
+```
+
+# Emulator
 https://github.com/espressif/esp-emulator
 ```
 idf.py -D IDF_TOOLCHAIN=clang set-target esp32p4
@@ -15,6 +29,9 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 0.514566
+  * Real hardware! esp32-p4-pico
+  * https://docs.waveshare.com/ESP32-P4-Pico
 * achieved tok/s: 3.502858
   * Fix watchdog warnings
 * achieved tok/s: 3.564400
