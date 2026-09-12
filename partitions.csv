@@ -1,6 +1,6 @@
 # Name,    Type, SubType,  Offset,   Size, Flags
 nvs,       data, nvs,     0x9000,  0x6000,
 phy_init,  data, phy,     0xf000,  0x1000,
-factory,   app,  factory, 0x10000, 600K,
+factory,   app,  factory, 0x10000, 620K,
 tokenizer, data, ,        ,        460K,
 model,     data, ,        ,        14900K,

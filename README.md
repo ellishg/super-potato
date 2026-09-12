@@ -13,8 +13,7 @@ idf.py build
 
 # Running
 ```
-idf.py flash
-idf.py monitor
+idf.py flash monitor
 # Use `Ctrl + ]` to exit
 ```
 
