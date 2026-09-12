@@ -6,25 +6,23 @@ This is an attempt to run an LLM on an esp32p4. The implementation was copied fr
 Install and activate eim
 https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html
 
-```
-idf.py -D IDF_TOOLCHAIN=clang set-target esp32p4
-```
-
 # Building
 ```
-idf.py -D IDF_TOOLCHAIN=clang build
+idf.py build
 ```
 
 # Running
 ```
 idf.py flash
+idf.py monitor
+# Use `Ctrl + ]` to exit
 ```
 
 # Emulator
 https://github.com/espressif/esp-emulator
+To run on an emulator, first remove `CONFIG_ESP32P4_SELECTS_REV_LESS_V3` from `sdkconfig.defaults` and fullclean.
 ```
-idf.py -D IDF_TOOLCHAIN=clang set-target esp32p4
-idf.py -D IDF_TOOLCHAIN=clang merge-bin
+idf.py merge-bin
 esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
