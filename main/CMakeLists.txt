@@ -19,7 +19,7 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
     target_link_libraries(${COMPONENT_LIB} PRIVATE utf8proc)
 endif()
 
-set_source_files_properties(
-    "${CMAKE_CURRENT_LIST_DIR}/main.c"
-    PROPERTIES COMPILE_OPTIONS "-ffast-math"
-)
+# set_source_files_properties(
+#     "${CMAKE_CURRENT_LIST_DIR}/main.c"
+#     PROPERTIES COMPILE_OPTIONS "-ffast-math"
+# )

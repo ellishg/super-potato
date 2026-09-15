@@ -14,6 +14,8 @@
 #define BYTES_TO_MB(bytes) ((uint32_t)((bytes) / (1024 * 1024)))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+// #define ENABLE_PROFILING 1
+
 static const char *TAG = "super-potato";
 int GS = 0; // group size global for quantization of the weights
 
@@ -25,6 +27,63 @@ void heap_alloc_failed_hook(size_t requested_size, uint32_t caps,
            function_name, BYTES_TO_MB(requested_size),
            BYTES_TO_MB(esp_get_minimum_free_heap_size()));
   abort();
+}
+
+enum {
+  TAG_QKV_MATMUL = 0,
+  TAG_ATT_MATMUL,
+  TAG_FFN_MATMUL,
+  TAG_XB_MATMUL,
+  TAG_LOGITS_MATMUL,
+  LAST_TAG = TAG_LOGITS_MATMUL,
+};
+#if defined(ENABLE_PROFILING)
+static const char *LABELS[LAST_TAG + 1] = {
+    "qkv_matmul", "att_matmul", "ffn_matmul", "xb_matmul", "logits_matmul",
+};
+
+typedef struct Profile {
+  int64_t start_time;
+  int64_t accumulated_time;
+  int64_t accumulated_bytes;
+} Profile;
+static Profile profiles[LAST_TAG + 1] = {0};
+#endif
+
+void profile_start(int tag) {
+#if defined(ENABLE_PROFILING)
+  profiles[tag].start_time = esp_timer_get_time();
+#endif
+}
+
+void profile_end(int tag, int bytes) {
+#if defined(ENABLE_PROFILING)
+  profiles[tag].accumulated_time +=
+      esp_timer_get_time() - profiles[tag].start_time;
+  profiles[tag].accumulated_bytes += bytes;
+#endif
+}
+
+void report_profiles() {
+#if defined(ENABLE_PROFILING)
+  ESP_LOGI(TAG, "Profiling report:");
+  int64_t total_time = 0;
+  for (int tag = 0; tag <= LAST_TAG; ++tag) {
+    total_time += profiles[tag].accumulated_time;
+  }
+  for (int tag = 0; tag <= LAST_TAG; ++tag) {
+    ESP_LOGI(TAG, "%s: %.3f s (%.2f%%), %" PRIu32 " MB (%.2f b/ms)",
+             LABELS[tag], profiles[tag].accumulated_time / 1e6,
+             (total_time > 0)
+                 ? (100.f * profiles[tag].accumulated_time / total_time)
+                 : 0.f,
+             BYTES_TO_MB(profiles[tag].accumulated_bytes),
+             (profiles[tag].accumulated_time > 0)
+                 ? ((float)profiles[tag].accumulated_bytes /
+                    profiles[tag].accumulated_time)
+                 : 0.f);
+  }
+#endif
 }
 
 // Copied from https://github.com/karpathy/llama2.c
@@ -259,13 +318,14 @@ void softmax(float *x, int size) {
   }
 }
 
-void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
+void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
+            int profile_tag) {
+  profile_start(profile_tag);
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   // inputs to this function are both quantized
 
   int i;
-#pragma omp parallel for private(i)
   for (i = 0; i < d; i++) {
 
     float val = 0.0f;
@@ -273,9 +333,11 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     int in = i * n;
 
     // do the matmul in groups of GS
+    // TODO: Do we have remaining elements?
+    // assert(n % GS == 0);
     int j;
-    // #pragma clang loop unroll(enable)
     for (j = 0; j <= n - GS; j += GS) {
+      // #pragma clang loop unroll(enable)
       for (int k = 0; k < GS; k++) {
         ival += ((int32_t)x->q[j + k]) * ((int32_t)w->q[in + j + k]);
       }
@@ -285,6 +347,7 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
 
     xout[i] = val;
   }
+  profile_end(profile_tag, n * d * sizeof(float));
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
@@ -315,9 +378,9 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // qkv matmuls for this position
     quantize(&s->xq, s->xb, dim);
-    matmul(s->q, &s->xq, w->wq + l, dim, dim);
-    matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
-    matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
+    matmul(s->q, &s->xq, w->wq + l, dim, dim, TAG_QKV_MATMUL);
+    matmul(s->k, &s->xq, w->wk + l, dim, kv_dim, TAG_QKV_MATMUL);
+    matmul(s->v, &s->xq, w->wv + l, dim, kv_dim, TAG_QKV_MATMUL);
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head
@@ -388,7 +451,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // final matmul to get the output of the attention
     quantize(&s->xq, s->xb, dim);
-    matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
+    matmul(s->xb2, &s->xq, w->wo + l, dim, dim, TAG_ATT_MATMUL);
 
     // residual connection back into x
     for (int i = 0; i < dim; i++) {
@@ -401,8 +464,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
     quantize(&s->xq, s->xb, dim);
-    matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
-    matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+    matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim, TAG_FFN_MATMUL);
+    matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim, TAG_FFN_MATMUL);
 
     // SwiGLU non-linearity
     for (int i = 0; i < hidden_dim; i++) {
@@ -416,7 +479,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // final matmul to get the output of the ffn
     quantize(&s->hq, s->hb, hidden_dim);
-    matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
+    matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim, TAG_XB_MATMUL);
 
     // residual connection
     for (int i = 0; i < dim; i++) {
@@ -429,7 +492,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
   // classifier into logits
   quantize(&s->xq, x, dim);
-  matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+  matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size, TAG_LOGITS_MATMUL);
   return s->logits;
 }
 
@@ -785,6 +848,9 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
          /*bos=*/1, /*eos=*/0, prompt_tokens, &num_prompt_tokens);
   assert(num_prompt_tokens > 0);
 
+  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
+           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
+
   // start the main loop
   // used to time our code, only initialized after first iteration
   int64_t start = 0;
@@ -871,6 +937,7 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
   free_run_state(&transformer.state);
   free(sorted_vocab);
   free_tokenizer(&tokenizer);
+  report_profiles();
 }
 
 esp_err_t run(void) {
@@ -887,8 +954,6 @@ esp_err_t run(void) {
   ESP_LOGI(TAG, "%" PRIu32 "MB %s flash", BYTES_TO_MB(flash_size),
            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded"
                                                          : "external");
-  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
-           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
 
   const esp_partition_t *partition = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
@@ -924,9 +989,6 @@ esp_err_t run(void) {
 
   esp_partition_munmap(model_map_handle);
   esp_partition_munmap(tokenizer_map_handle);
-
-  ESP_LOGI(TAG, "Minimum free heap size: %" PRIu32 " KB",
-           BYTES_TO_KB(esp_get_minimum_free_heap_size()));
   return ESP_OK;
 }
 
