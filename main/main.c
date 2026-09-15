@@ -4,6 +4,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_psram.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +15,18 @@
 #define BYTES_TO_MB(bytes) ((uint32_t)((bytes) / (1024 * 1024)))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+// https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/mem_alloc.html
+#define MALLOC(size, capabilities)                                             \
+  ({                                                                           \
+    void *ptr = heap_caps_malloc(size, capabilities);                          \
+    assert(ptr);                                                               \
+    ptr;                                                                       \
+  })
+// Smaller faster internal memory
+#define MALLOC_INTERNAL(size) MALLOC(size, MALLOC_CAP_INTERNAL)
+// Larger slower PSRAM memory
+#define MALLOC_SPIRAM(size) MALLOC(size, MALLOC_CAP_SPIRAM)
+
 // #define ENABLE_PROFILING 1
 
 static const char *TAG = "super-potato";
@@ -22,11 +35,10 @@ int GS = 0; // group size global for quantization of the weights
 void heap_alloc_failed_hook(size_t requested_size, uint32_t caps,
                             const char *function_name) {
   ESP_LOGE(TAG,
-           "%s failed to allocate %" PRIu32 " MB (free heap size: %" PRIu32
-           " MB)",
-           function_name, BYTES_TO_MB(requested_size),
-           BYTES_TO_MB(esp_get_minimum_free_heap_size()));
-  abort();
+           "%s failed to allocate %" PRIu32
+           " MB with capabilities 0x%lX (free heap size: %" PRIu32 " MB)",
+           function_name, BYTES_TO_MB(requested_size), caps,
+           BYTES_TO_MB(heap_caps_get_free_size(caps)));
 }
 
 enum {
@@ -161,22 +173,24 @@ typedef struct {
 
 void malloc_run_state(RunState *s, const Config *p) {
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = malloc(p->dim * sizeof(float));
-  s->xb = malloc(p->dim * sizeof(float));
-  s->xb2 = malloc(p->dim * sizeof(float));
-  s->hb = malloc(p->hidden_dim * sizeof(float));
-  s->hb2 = malloc(p->hidden_dim * sizeof(float));
-  s->xq.q = malloc(p->dim * sizeof(int8_t));
-  s->xq.s = malloc(p->dim * sizeof(float));
-  s->hq.q = malloc(p->hidden_dim * sizeof(int8_t));
-  s->hq.s = malloc(p->hidden_dim * sizeof(float));
-  s->q = malloc(p->dim * sizeof(float));
-  s->k = malloc(kv_dim * sizeof(float));
-  s->v = malloc(kv_dim * sizeof(float));
-  s->att = malloc(p->n_heads * p->seq_len * sizeof(float));
-  s->logits = malloc(p->vocab_size * sizeof(float));
-  s->key_cache = malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
-  s->value_cache = malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
+  s->x = MALLOC_INTERNAL(p->dim * sizeof(float));
+  s->xb = MALLOC_INTERNAL(p->dim * sizeof(float));
+  s->xb2 = MALLOC_INTERNAL(p->dim * sizeof(float));
+  s->hb = MALLOC_INTERNAL(p->hidden_dim * sizeof(float));
+  s->hb2 = MALLOC_INTERNAL(p->hidden_dim * sizeof(float));
+  s->xq.q = MALLOC_INTERNAL(p->dim * sizeof(int8_t));
+  s->xq.s = MALLOC_INTERNAL(p->dim * sizeof(float));
+  s->hq.q = MALLOC_INTERNAL(p->hidden_dim * sizeof(int8_t));
+  s->hq.s = MALLOC_INTERNAL(p->hidden_dim * sizeof(float));
+  s->q = MALLOC_INTERNAL(p->dim * sizeof(float));
+  s->k = MALLOC_INTERNAL(kv_dim * sizeof(float));
+  s->v = MALLOC_INTERNAL(kv_dim * sizeof(float));
+  s->att = MALLOC_INTERNAL(p->n_heads * p->seq_len * sizeof(float));
+  s->logits = MALLOC_INTERNAL(p->vocab_size * sizeof(float));
+  s->key_cache =
+      MALLOC_SPIRAM(p->n_layers * p->seq_len * kv_dim * sizeof(float));
+  s->value_cache =
+      MALLOC_SPIRAM(p->n_layers * p->seq_len * kv_dim * sizeof(float));
 }
 
 void free_run_state(RunState *s) {
@@ -234,7 +248,7 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
 QuantizedTensor *init_quantized_tensors(const void **ptr, int n,
                                         int size_each) {
   const void *p = *ptr;
-  QuantizedTensor *res = malloc(n * sizeof(QuantizedTensor));
+  QuantizedTensor *res = MALLOC_INTERNAL(n * sizeof(QuantizedTensor));
   for (int i = 0; i < n; i++) {
     /* map quantized int8 values*/
     res[i].q = (int8_t *)p;
@@ -521,7 +535,7 @@ void build_tokenizer(Tokenizer *tokenizer, const void *tokenizer_data,
   memcpy(&tokenizer->max_token_length, data,
          sizeof(tokenizer->max_token_length));
   data += sizeof(tokenizer->max_token_length);
-  tokenizer->vocabs = malloc(vocab_size * sizeof(Vocab));
+  tokenizer->vocabs = MALLOC_SPIRAM(vocab_size * sizeof(Vocab));
 
   for (int i = 0; i < vocab_size; i++) {
     memcpy(&tokenizer->vocabs[i].score, data, sizeof(float));
@@ -596,7 +610,8 @@ void encode(const Tokenizer *t, TokenIndex *sorted_vocab, int vocab_size,
   // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
-  char *str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+  char *str_buffer =
+      MALLOC_INTERNAL((t->max_token_length * 2 + 1 + 2) * sizeof(char));
 
   // start at 0 tokens
   *n_tokens = 0;
@@ -791,7 +806,7 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature,
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+  sampler->probindex = MALLOC_SPIRAM(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler *sampler) { free(sampler->probindex); }
@@ -843,7 +858,8 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
   // encode the (string) prompt into tokens sequence
   int num_prompt_tokens = 0;
   // +3 for '\0', ?BOS, ?EOS
-  int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
+  int *prompt_tokens =
+      (int *)MALLOC_INTERNAL((strlen(prompt) + 3) * sizeof(int));
   encode(tokenizer, sorted_vocab, transformer->config->vocab_size, prompt,
          /*bos=*/1, /*eos=*/0, prompt_tokens, &num_prompt_tokens);
   assert(num_prompt_tokens > 0);
@@ -920,7 +936,7 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
   Tokenizer tokenizer;
   build_tokenizer(&tokenizer, tokenizer_data, p->vocab_size);
   // Init
-  TokenIndex *sorted_vocab = malloc(p->vocab_size * sizeof(TokenIndex));
+  TokenIndex *sorted_vocab = MALLOC_SPIRAM(p->vocab_size * sizeof(TokenIndex));
   for (int i = 0; i < p->vocab_size; i++) {
     sorted_vocab[i].vocab = &tokenizer.vocabs[i];
     sorted_vocab[i].id = i;
@@ -932,7 +948,7 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
                 /*TopP=*/0.9f, /*Seed=*/101);
 
   generate(&transformer, &tokenizer, sorted_vocab, &sampler,
-           "Tell me a quick story.", MIN(200, p->seq_len));
+           "Tell me a quick story.", MIN(10, p->seq_len));
   free_sampler(&sampler);
   free_run_state(&transformer.state);
   free(sorted_vocab);
@@ -946,6 +962,8 @@ esp_err_t run(void) {
       "Failed to register heap allocation failed callback");
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
+  ESP_RETURN_ON_FALSE(esp_psram_is_initialized(), ESP_ERR_NOT_SUPPORTED, TAG,
+                      "PSRAM required");
 
   uint32_t flash_size;
   ESP_RETURN_ON_ERROR(esp_flash_get_size(NULL, &flash_size), TAG,
