@@ -16,9 +16,10 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 // https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/mem_alloc.html
+// TODO: Not all memory needs to be aligned
 #define MALLOC(size, capabilities)                                             \
   ({                                                                           \
-    void *ptr = heap_caps_malloc(size, capabilities);                          \
+    void *ptr = heap_caps_aligned_alloc(128, size, capabilities);              \
     assert(ptr);                                                               \
     ptr;                                                                       \
   })
@@ -27,7 +28,7 @@
 // Larger slower PSRAM memory
 #define MALLOC_SPIRAM(size) MALLOC(size, MALLOC_CAP_SPIRAM)
 
-// #define ENABLE_PROFILING 1
+#define ENABLE_PROFILING 1
 
 static const char *TAG = "super-potato";
 int GS = 0; // group size global for quantization of the weights
@@ -332,15 +333,22 @@ void softmax(float *x, int size) {
   }
 }
 
-extern void dsps_dp_s8_arp4(const int8_t *a, const int8_t *b, int32_t *dest,
-                            int len);
+extern int32_t dsps_dp_s8_arp4(const int8_t *a, const int8_t *b, int len);
 
-static esp_err_t dsps_dp_s8(const int8_t *a, const int8_t *b, int32_t *dest,
-                            int len) {
-  if (len <= 0 || len % 16)
-    return ESP_ERR_INVALID_ARG;
-  dsps_dp_s8_arp4(a, b, dest, len);
-  return ESP_OK;
+static int32_t dsps_dp_s8(const int8_t *a, const int8_t *b, int len) {
+  assert(a && b);
+  assert((uintptr_t)a % 16 == 0);
+  // TODO: n must be a multiple of 16. Sometimes it is 684 and we must
+  // use slow path
+  if ((uintptr_t)b % 16) {
+    int32_t acc = 0;
+    for (int i = 0; i < len; i++)
+      acc += (int32_t)a[i] * (int32_t)b[i];
+    return acc;
+  }
+  assert((uintptr_t)b % 16 == 0);
+  assert(len > 0 && len % 16 == 0);
+  return dsps_dp_s8_arp4(a, b, len);
 }
 
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
@@ -361,8 +369,7 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
     // assert(n % GS == 0);
     int j;
     for (j = 0; j <= n - GS; j += GS) {
-      int32_t ival = 0;
-      ESP_ERROR_CHECK(dsps_dp_s8(x->q + j, w->q + in + j, &ival, GS));
+      int32_t ival = dsps_dp_s8(x->q + j, w->q + in + j, GS);
       val += ((float)ival) * w->s[(in + j) / GS] * x->s[j / GS];
     }
 

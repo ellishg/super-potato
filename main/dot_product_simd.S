@@ -1,14 +1,12 @@
-// https://github.com/espressif/esp-dsp/blob/3c8ac0fdfec83740b783e200862c8d0c056de0ad/modules/dotprod/fixed/dsps_dp_s8_arp4.S
+// https://github.com/espressif/esp-dl/blob/master/tools/agents/skills/esp32p4-pie-simd/references/instructions.md
 
 // https://godbolt.org/z/67TPP311T
-// esp_err_t dsps_dp_s8_ansi(const int8_t *src1, const int8_t *src2, int32_t *dest, int len)
+// int32_t dsps_dp_s8_ansi(const int8_t *a, const int8_t *b, int len)
 // {
 //     int32_t acc = 0;
-//     for (int i = 0 ; i < len ; i++) {
-//         acc += src1[i] * src2[i];
-//     }
-//     *dest = acc;
-//     return ESP_OK;
+//     for (int i = 0 ; i < len ; i++)
+//         acc += a[i] * b[i];
+//     return acc;
 // }
 
   .text
@@ -16,29 +14,23 @@
   .global dsps_dp_s8_arp4
   .type dsps_dp_s8_arp4,@function
 
-// void dsps_dp_s8_arp4(const int8_t *src1, const int8_t *src2, int32_t *dest, int len);
+// int32_t dsps_dp_s8_arp4(const int8_t *a, const int8_t *b, int len);
 dsps_dp_s8_arp4:
-  // a0 = src1
-  // a1 = src2
-  // a2 = dest
-  // a3 = len
-  // a4 = acc
+  // a0, q0 = a
+  // a1, q1 = b
+  // a2     = len
 
-  li    a4, 0
-  add   a3, a3, a0
+  srli  a2, a2, 4
+  esp.zero.xacc
 
-.Lloop:
-  lb    a5, 0(a0)
-  lb    a6, 0(a1)
-  // acc += src1[i] * src2[i]
-  mul   a5, a6, a5
-  add   a4, a4, a5
+  // Load 16 bytes into vectors
+  esp.vld.128.ip    q0, a0, 16
+  esp.vld.128.ip    q1, a1, 16
 
-  addi  a0, a0, 1
-  addi  a1, a1, 1
-  // if (src1 < src1 + len) goto loop
-  blt   a0, a3, .Lloop
+  // Loop len/16 times (.Lloop_end is the last instruction in each iteration)
+  esp.lp.setup      0, a2, .Lloop_end
+    esp.vmulas.s8.xacc.ld.ip    q0, a0, 16, q0, q1
+.Lloop_end: esp.vld.128.ip    q1, a1, 16
 
-  // *dst = acc
-  sw    a4, 0(a2)
+  esp.movx.r.xacc.l   a0
   ret
