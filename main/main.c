@@ -332,6 +332,17 @@ void softmax(float *x, int size) {
   }
 }
 
+extern void dsps_dp_s8_arp4(const int8_t *a, const int8_t *b, int32_t *dest,
+                            int len);
+
+static esp_err_t dsps_dp_s8(const int8_t *a, const int8_t *b, int32_t *dest,
+                            int len) {
+  if (len <= 0 || len % 16)
+    return ESP_ERR_INVALID_ARG;
+  dsps_dp_s8_arp4(a, b, dest, len);
+  return ESP_OK;
+}
+
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
             int profile_tag) {
   profile_start(profile_tag);
@@ -343,7 +354,6 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
   for (i = 0; i < d; i++) {
 
     float val = 0.0f;
-    int32_t ival = 0;
     int in = i * n;
 
     // do the matmul in groups of GS
@@ -351,12 +361,9 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
     // assert(n % GS == 0);
     int j;
     for (j = 0; j <= n - GS; j += GS) {
-      // #pragma clang loop unroll(enable)
-      for (int k = 0; k < GS; k++) {
-        ival += ((int32_t)x->q[j + k]) * ((int32_t)w->q[in + j + k]);
-      }
+      int32_t ival = 0;
+      ESP_ERROR_CHECK(dsps_dp_s8(x->q + j, w->q + in + j, &ival, GS));
       val += ((float)ival) * w->s[(in + j) / GS] * x->s[j / GS];
-      ival = 0;
     }
 
     xout[i] = val;
@@ -424,7 +431,6 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // multihead attention. iterate over all heads
     int h;
-#pragma omp parallel for private(h)
     for (h = 0; h < p->n_heads; h++) {
       // get the query vector for this head
       float *q = s->q + h * head_size;

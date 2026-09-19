@@ -9,9 +9,10 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
         GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(utf8proc_source)
+    target_compile_options(utf8proc PRIVATE "-Wno-error=incompatible-pointer-types")
 endif()
 
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "main.c" "dot_product_simd.S"
                        PRIV_REQUIRES spi_flash esp_partition esp_timer esp_psram
                        INCLUDE_DIRS "")
 
@@ -21,5 +22,8 @@ endif()
 
 # set_source_files_properties(
 #     "${CMAKE_CURRENT_LIST_DIR}/main.c"
-#     PROPERTIES COMPILE_OPTIONS "-ffast-math"
+#     PROPERTIES COMPILE_OPTIONS
+#     "-ffast-math"
+#     "-fvectorize"
+#     "-fslp-vectorize"
 # )

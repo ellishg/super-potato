@@ -26,6 +26,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 0.515770
+  * Hand-written dot product assembly and GCC
 * achieved tok/s: 0.514566
   * Real hardware! esp32-p4-pico
   * https://docs.waveshare.com/ESP32-P4-Pico
