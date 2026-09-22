@@ -26,6 +26,8 @@ esp-emu --chip esp32p4 --firmware build/merged-binary.bin
 ```
 
 # Perf History
+* achieved tok/s: 0.608929
+  * Write more custom assembly
 * achieved tok/s: 0.571630
   * Use custom esp32 SIMD instructions in some cases
 * achieved tok/s: 0.515770

@@ -333,23 +333,8 @@ void softmax(float *x, int size) {
   }
 }
 
-extern int32_t dsps_dp_s8_arp4(const int8_t *a, const int8_t *b, int len);
-
-static int32_t dsps_dp_s8(const int8_t *a, const int8_t *b, int len) {
-  assert(a && b);
-  assert((uintptr_t)a % 16 == 0);
-  // TODO: n must be a multiple of 16. Sometimes it is 684 and we must
-  // use slow path
-  if ((uintptr_t)b % 16) {
-    int32_t acc = 0;
-    for (int i = 0; i < len; i++)
-      acc += (int32_t)a[i] * (int32_t)b[i];
-    return acc;
-  }
-  assert((uintptr_t)b % 16 == 0);
-  assert(len > 0 && len % 16 == 0);
-  return dsps_dp_s8_arp4(a, b, len);
-}
+extern float matmul_asm(const int8_t *w, const float *ws, const int8_t *x,
+                        const float *xs, int n, int GS);
 
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
             int profile_tag) {
@@ -357,23 +342,27 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   // inputs to this function are both quantized
-
-  int i;
-  for (i = 0; i < d; i++) {
-
-    float val = 0.0f;
-    int in = i * n;
-
-    // do the matmul in groups of GS
-    // TODO: Do we have remaining elements?
-    // assert(n % GS == 0);
-    int j;
-    for (j = 0; j <= n - GS; j += GS) {
-      int32_t ival = dsps_dp_s8(x->q + j, w->q + in + j, GS);
-      val += ((float)ival) * w->s[(in + j) / GS] * x->s[j / GS];
+  // TODO: Do we have remaining elements?
+  // assert(n % GS == 0);
+  if (n % 16) {
+    for (int i = 0; i < d; i++) {
+      float acc = 0.f;
+      for (int j = 0; j < n; j += GS) {
+        int32_t ival = 0;
+        for (int k = 0; k < GS; k++)
+          ival += w->q[i * n + j + k] * x->q[j + k];
+        acc += ((float)ival) * w->s[(i * n + j) / GS] * x->s[j / GS];
+      }
+      xout[i] = acc;
     }
-
-    xout[i] = val;
+  } else {
+    assert(d % 4 == 0);
+    assert(n % 16 == 0);
+    assert(GS % 16 == 0);
+    for (int i = 0; i < d; i++) {
+      xout[i] =
+          matmul_asm(&w->q[i * n], &w->s[(i * n) / GS], x->q, x->s, n, GS);
+    }
   }
   profile_end(profile_tag, n * d * sizeof(float));
 }
@@ -912,6 +901,7 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
 
     // init the timer here because the first iteration can be slower
     if (start == 0) {
+      vTaskDelay(1);
       start = esp_timer_get_time();
     } else if (esp_timer_get_time() - start > 500) {
       // Periodically prevent the watchdog timer from triggering
@@ -920,13 +910,14 @@ void generate(Transformer *transformer, const Tokenizer *tokenizer,
   }
   printf("\n");
 
-  // report achieved tok/s (pos-1 because the timer starts after first
-  // iteration)
-  if (pos > 1) {
-    int64_t end = esp_timer_get_time();
-    ESP_LOGI(TAG, "achieved tok/s: %f\n",
-             (pos - 1) / (double)(end - start) * 1e6);
-  }
+  // pos-1 because the timer starts after first iteration
+  int64_t end = esp_timer_get_time();
+  float total_time = end - start;
+  ESP_LOGI(TAG, "achieved tok/s: %f\n", (pos - 1) / total_time * 1e6);
+  ESP_LOGI(TAG, "Total time: %f seconds\n", total_time / 1e6);
+
+  ESP_LOGI(TAG, "Free internal heap size: %" PRIu32 " MB",
+           BYTES_TO_MB(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
   free(prompt_tokens);
 }
@@ -1017,6 +1008,9 @@ esp_err_t run(void) {
            tokenizer_data, BYTES_TO_MB(tokenizer_size));
 
   run_with_model(model_data, tokenizer_data);
+
+  // https://github.com/espressif/esp-idf/blob/master/examples/system/cache_counters/main/cache_counters_example_main.c
+  // ESP_ERROR_CHECK(esp_cache_cnt_dump(NULL));
 
   esp_partition_munmap(model_map_handle);
   esp_partition_munmap(tokenizer_map_handle);
