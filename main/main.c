@@ -28,7 +28,7 @@
 // Larger slower PSRAM memory
 #define MALLOC_SPIRAM(size) MALLOC(size, MALLOC_CAP_SPIRAM)
 
-#define ENABLE_PROFILING 1
+// #define ENABLE_PROFILING 1
 
 static const char *TAG = "super-potato";
 int GS = 0; // group size global for quantization of the weights
@@ -352,8 +352,13 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
       for (int j = 0; j < n; j++)
         scratch[j / GS] += w->q[i * n + j] * x->q[j];
     } else {
-      assert(n % 16 == 0);
-      assert(GS % 16 == 0);
+      assert(n == 256);
+      assert(GS == 64);
+      // TODO: I'm pretty sure we are memory bound. x->q doesn't change, so it
+      // likely sits in the cache. w->q on the other hand is large.
+      // * I tried computing xout[i...i+4] together since x is constant
+      // * I tried preloading vectors q0..q8 to take advantage of L2 cache
+      // * Maybe QACC can help, but I'm not sure how I would use it
       dot_product(scratch, &w->q[i * n], x->q, n, GS);
     }
     float acc = 0.f;
@@ -949,7 +954,7 @@ void run_with_model(const void *model_data, const void *tokenizer_data) {
                 /*TopP=*/0.9f, /*Seed=*/101);
 
   generate(&transformer, &tokenizer, sorted_vocab, &sampler,
-           "Tell me a quick story.", MIN(10, p->seq_len));
+           "Tell me a quick story.", MIN(100, p->seq_len));
   free_sampler(&sampler);
   free_run_state(&transformer.state);
   free(sorted_vocab);
