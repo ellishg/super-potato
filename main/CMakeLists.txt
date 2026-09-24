@@ -12,7 +12,7 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
     target_compile_options(utf8proc PRIVATE "-Wno-error=incompatible-pointer-types")
 endif()
 
-idf_component_register(SRCS "main.c" "matmul.S"
+idf_component_register(SRCS "main.c" "dot_product.S"
                        PRIV_REQUIRES spi_flash esp_partition esp_timer esp_psram
                        INCLUDE_DIRS "")
 
