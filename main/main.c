@@ -359,6 +359,7 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
       // * I tried computing xout[i...i+4] together since x is constant
       // * I tried preloading vectors q0..q8 to take advantage of L2 cache
       // * Maybe QACC can help, but I'm not sure how I would use it
+      // * I can retrain the model to ensure n % 16 == 0 in all cases
       dot_product(scratch, &w->q[i * n], x->q, n, GS);
     }
     float acc = 0.f;
