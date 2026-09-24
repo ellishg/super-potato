@@ -336,25 +336,6 @@ void softmax(float *x, int size) {
 extern void dot_product(int32_t *out, const int8_t *a, const int8_t *b, int n,
                         int GS);
 
-float quantized_dot_product(QuantizedTensor *x, QuantizedTensor *w, int i,
-                            int n) {
-  int32_t scratch[n / GS];
-  if (n % 16) {
-    for (int j = 0; j < n / GS; j++)
-      scratch[j] = 0;
-    for (int j = 0; j < n; j++)
-      scratch[j / GS] += w->q[i * n + j] * x->q[j];
-  } else {
-    assert(n % 16 == 0);
-    assert(GS % 16 == 0);
-    dot_product(scratch, &w->q[i * n], x->q, n, GS);
-  }
-  float acc = 0.f;
-  for (int j = 0; j < n; j += GS)
-    acc += ((float)scratch[j / GS]) * w->s[(i * n + j) / GS] * x->s[j / GS];
-  return acc;
-}
-
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
             int profile_tag) {
   profile_start(profile_tag);
@@ -363,8 +344,23 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
   // inputs to this function are both quantized
   // TODO: Do we have remaining elements?
   // assert(n % GS == 0);
-  for (int i = 0; i < d; i++)
-    xout[i] = quantized_dot_product(x, w, i, n);
+  int32_t scratch[n / GS];
+  for (int i = 0; i < d; i++) {
+    if (n % 16) {
+      for (int j = 0; j < n / GS; j++)
+        scratch[j] = 0;
+      for (int j = 0; j < n; j++)
+        scratch[j / GS] += w->q[i * n + j] * x->q[j];
+    } else {
+      assert(n % 16 == 0);
+      assert(GS % 16 == 0);
+      dot_product(scratch, &w->q[i * n], x->q, n, GS);
+    }
+    float acc = 0.f;
+    for (int j = 0; j < n; j += GS)
+      acc += ((float)scratch[j / GS]) * w->s[(i * n + j) / GS] * x->s[j / GS];
+    xout[i] = acc;
+  }
   profile_end(profile_tag, n * d * sizeof(float));
 }
 
