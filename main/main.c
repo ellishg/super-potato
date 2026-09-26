@@ -354,6 +354,8 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d,
     } else {
       assert(n == 256);
       assert(GS == 64);
+      assert(n % GS == 0);
+      assert(GS % 16 == 0);
       // TODO: I'm pretty sure we are memory bound. x->q doesn't change, so it
       // likely sits in the cache. w->q on the other hand is large.
       // * I tried computing xout[i...i+4] together since x is constant
